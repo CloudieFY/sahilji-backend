@@ -26,91 +26,153 @@ exports.getRental = async (req, res) => {
 
 // POST /api/rentals - complex: compute total, update item/customer
 exports.createRental = async (req, res) => {
+  let session;
+  // Use a database transaction to ensure all rentals are created or none are.
   try {
+    session = await Rental.startSession();
+    session.startTransaction();
     const {
-      itemId,
       customerId,
-      billNo,
+      billNo: clientBillNo, // Use a different name to avoid confusion
       address,
-      itemNo,
-      deliveryDate,
-      deliveryTimePeriod,
-      endTimePeriod,
-      startDate,
-      endDate,
-      rate = 0,
-      quantity = 1,
-      lostQuantity = 0,
-      discount = 0,
-      penalty = 0,
-      remark = '',
       advance = 0,
+      discount: billDiscount = 0, // Bill-level discount
       securityAmount = 0,
-      securityReturned = false,
-      securityReturnedAt = null,
       signature = '',
-      total,
-      status,
+      pieces = [], // Expect an array of pieces for the bill
     } = req.body;
 
-    // Frontend sends lowercase statuses; normalize defensively.
-    let normalizedStatus = status;
-    if (typeof normalizedStatus === 'string') {
-      normalizedStatus = normalizedStatus.toLowerCase();
-    }
-    if (!normalizedStatus || !Object.values(RentalStatus).includes(normalizedStatus)) {
-      // Default to UPCOMING if invalid/missing.
-      normalizedStatus = RentalStatus.UPCOMING;
+    // --- Pre-transaction Validation ---
+    if (!pieces || pieces.length === 0) {
+      return res.status(400).json({ error: 'At least one piece is required for a rental bill.' });
     }
 
-    // Validate references
-    const item = await Item.findOne({ customId: itemId });
-    if (!item) return res.status(404).json({ error: 'Item not found' });
+    // --- Customer Validation ---
+    const customer = await Customer.findOne({ customId: customerId }).session(session);
+    if (!customer) {
+      await session.abortTransaction();
+      session.endSession();
+      return res.status(404).json({ error: 'Customer not found' });
+    }
 
-    const customer = await Customer.findOne({ customId: customerId });
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+    // --- Bill Number Generation (moved to backend for performance) ---
+    let billNo = clientBillNo;
+    if (!billNo) {
+      const lastRentalWithBillNo = await Rental.findOne({ billNo: { $regex: /^BILL-/ } })
+        .sort({ billNo: -1 })
+        .session(session);
 
-    const rental = new Rental({
-      item: item._id,
-      customer: customer._id,
-      billNo,
-      address,
-      itemNo: itemNo || item.customId,
-      deliveryDate: deliveryDate ? new Date(deliveryDate) : null,
-      deliveryTimePeriod: deliveryTimePeriod || '',
-      endTimePeriod: endTimePeriod || '',
-      rate: Number(rate) || Number(total) || 0,
-      quantity: Math.max(0, Number(quantity) || 1),
-      lostQuantity: Math.max(0, Number(lostQuantity) || 0),
-      discount: Number(discount) || 0,
-      penalty: Number(penalty) || 0,
-      remark,
-      advance: Number(advance) || 0,
-      securityAmount: Number(securityAmount) || 0,
-      securityReturned: Boolean(securityReturned),
-      securityReturnedAt: securityReturnedAt ? new Date(securityReturnedAt) : null,
-      signature,
-      startDate: new Date(startDate),
-      endDate: new Date(endDate),
-      total: Number(total) || 0,
-      status: normalizedStatus,
-    });
-    await rental.save();
+      let nextSeq = 1;
+      if (lastRentalWithBillNo && lastRentalWithBillNo.billNo) {
+        const match = lastRentalWithBillNo.billNo.match(/BILL-(\d+)/);
+        if (match) {
+          nextSeq = parseInt(match[1], 10) + 1;
+        }
+      }
+      billNo = `BILL-${String(nextSeq).padStart(4, "0")}`;
+    }
 
-    // Update item
-    item.timesRented += 1;
-    if (normalizedStatus === RentalStatus.ACTIVE) item.status = ItemStatus.RENTED;
-    else if (normalizedStatus === RentalStatus.UPCOMING) item.status = ItemStatus.RESERVED;
-    await item.save();
 
-    // Update customer
-    customer.rentals += 1;
-    customer.totalSpent += Number(total) || 0;
-    await customer.save();
+    const createdRentals = [];
+    let subTotalForAllPieces = 0;
+    for (const piece of pieces) {
+      subTotalForAllPieces += (Number(piece.rate) || 0) * (Number(piece.quantity) || 1);
+    }
 
-    const populatedRental = await Rental.findById(rental._id).populate('item customer');
+    let totalBillAmountAfterDiscount = 0;
+
+    // --- Loop through each piece in the bill ---
+    for (const [index, piece] of pieces.entries()) {
+      const {
+        itemId,
+        itemNo,
+        deliveryDate,
+        deliveryTimePeriod, // Piece-level discount
+        penalty = 0, // Piece-level penalty
+        endDate,
+        endTimePeriod,
+        rate = 0,
+        quantity = 1,
+        remark = '',
+        status,
+      } = piece;
+
+      // --- Item Validation ---
+      const item = await Item.findOne({ customId: itemId }).session(session);
+      if (!item) {
+        throw new Error(`Item with ID ${itemId} not found.`);
+      }
+
+      // --- Status Normalization ---
+      let normalizedStatus = typeof status === 'string' ? status.toLowerCase() : RentalStatus.UPCOMING;
+      if (!Object.values(RentalStatus).includes(normalizedStatus)) {
+        normalizedStatus = RentalStatus.UPCOMING;
+      }
+
+      // Calculate total for this specific piece, including its discount, penalty, and shared advance/security
+      const pieceSubTotal = (Number(rate) || 0) * (Number(quantity) || 1);
+      // Assign the entire bill discount to the first item only.
+      const pieceDiscount = index === 0 ? billDiscount : 0;
+      const pieceAdvance = index === 0 ? (Number(advance) || 0) : 0;
+      const pieceSecurityAmount = index === 0 ? (Number(securityAmount) || 0) : 0;
+      let pieceFinalTotal = pieceSubTotal - pieceDiscount + (Number(penalty) || 0) + pieceSecurityAmount;
+      totalBillAmountAfterDiscount += pieceFinalTotal;
+
+      const rental = new Rental({
+        // Bill-level details
+        customer: customer._id,
+        billNo,
+        address,
+        advance: pieceAdvance,
+        securityAmount: pieceSecurityAmount,
+        signature,
+        // Piece-specific details
+        item: item._id,
+        itemNo: itemNo || item.customId,
+        deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
+        deliveryTimePeriod: deliveryTimePeriod || '',
+        discount: pieceDiscount, // Store piece-level discount
+        penalty: Number(penalty) || 0, // Store piece-level penalty
+        endDate: new Date(endDate),
+        endTimePeriod: endTimePeriod || '',
+        rate: Number(rate) || 0,
+        quantity: Math.max(1, Number(quantity) || 1),
+        remark,
+        status: normalizedStatus,
+        total: pieceFinalTotal, // Store the final total after discount/penalty
+        // Default values for other fields
+        lostQuantity: 0,
+        securityReturned: false,
+        securityReturnedAt: null,
+        startDate: new Date(deliveryDate), // Assuming startDate is same as deliveryDate
+      });
+
+      await rental.save({ session });
+      createdRentals.push(rental);
+
+      // --- Update Item ---
+      item.timesRented += 1;
+      if (normalizedStatus === RentalStatus.ACTIVE) item.status = ItemStatus.RENTED;
+      else if (normalizedStatus === RentalStatus.UPCOMING) item.status = ItemStatus.RESERVED;
+      await item.save({ session });
+    }
+
+    // --- Update Customer ---
+    customer.rentals += pieces.length;
+    customer.totalSpent += totalBillAmountAfterDiscount; // totalBillAmount now includes security amount for the first item
+    await customer.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
+
+    // Populate and return the first created rental as a representative for the bill
+    const populatedRental = await Rental.findById(createdRentals[0]._id).populate('item customer');
     res.status(201).json(populatedRental);
   } catch (err) {
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
+    if (session) session.endSession();
     res.status(400).json({ error: err.message });
   }
 };
@@ -279,38 +341,52 @@ exports.updateRental = async (req, res) => {
 
 // DELETE /api/rentals/:id
 exports.deleteRental = async (req, res) => {
+  const { billNo } = req.query;
+  const { id } = req.params;
+
   try {
-    // Find and populate to update counters if needed
-    const rental = await Rental.findOne({ customId: req.params.id }).populate('item customer');
-    if (!rental) return res.status(404).json({ error: 'Rental not found' });
-    
-    // Rollback counters and restore item availability when no open rentals remain.
-    if (rental.item) {
-      rental.item.timesRented = Math.max(0, rental.item.timesRented - 1);
-      const remainingOpenRental = await Rental.findOne({
-        _id: { $ne: rental._id },
-        item: rental.item._id,
-        status: { $in: [RentalStatus.ACTIVE, RentalStatus.UPCOMING] }
-      });
+    let rentalsToDelete;
+    if (billNo) {
+      rentalsToDelete = await Rental.find({ billNo }).populate('item customer');
+    } else {
+      const singleRental = await Rental.findOne({ customId: id }).populate('item customer');
+      rentalsToDelete = singleRental ? [singleRental] : [];
+    }
 
-      if (!remainingOpenRental) {
-        rental.item.status = ItemStatus.AVAILABLE;
-      } else if (remainingOpenRental.status === RentalStatus.ACTIVE) {
-        rental.item.status = ItemStatus.RENTED;
-      } else {
-        rental.item.status = ItemStatus.RESERVED;
+    if (rentalsToDelete.length === 0) {
+      return res.status(404).json({ error: 'Rental(s) not found' });
+    }
+
+    for (const rental of rentalsToDelete) {
+      // Rollback counters and restore item availability when no open rentals remain.
+      if (rental.item) {
+        rental.item.timesRented = Math.max(0, rental.item.timesRented - 1);
+        const remainingOpenRental = await Rental.findOne({
+          _id: { $ne: rental._id },
+          item: rental.item._id,
+          status: { $in: [RentalStatus.ACTIVE, RentalStatus.UPCOMING] }
+        });
+
+        if (!remainingOpenRental) {
+          rental.item.status = ItemStatus.AVAILABLE;
+        } else if (remainingOpenRental.status === RentalStatus.ACTIVE) {
+          rental.item.status = ItemStatus.RENTED;
+        } else {
+          rental.item.status = ItemStatus.RESERVED;
+        }
+        await rental.item.save();
       }
+      if (rental.customer) {
+        rental.customer.rentals = Math.max(0, rental.customer.rentals - 1);
+        rental.customer.totalSpent = Math.max(0, rental.customer.totalSpent - rental.total);
+        await rental.customer.save();
+      }
+    }
 
-      await rental.item.save();
-    }
-    if (rental.customer) {
-      rental.customer.rentals = Math.max(0, rental.customer.rentals - 1);
-      rental.customer.totalSpent = Math.max(0, rental.customer.totalSpent - rental.total);
-      await rental.customer.save();
-    }
-    
-    await Rental.findOneAndDelete({ customId: req.params.id });
-    res.json({ message: 'Rental deleted' });
+    const idsToDelete = rentalsToDelete.map(r => r._id);
+    await Rental.deleteMany({ _id: { $in: idsToDelete } });
+
+    res.json({ message: 'Rental bill deleted successfully' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
