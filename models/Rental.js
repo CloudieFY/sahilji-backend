@@ -19,6 +19,10 @@ const rentalSchema = new mongoose.Schema({
   lostQuantity: { type: Number, default: 0, min: 0 },
   discount: { type: Number, default: 0, min: 0 },
   penalty: { type: Number, default: 0, min: 0 },
+  payments: [{
+    amount: { type: Number, default: 0, min: 0 },
+    date: { type: Date, default: null },
+  }],
   remark: { type: String, default: '' },
   remarkCompleted: { type: Boolean, default: false },
   remarkConfirmedBy: { type: String, default: '' },
