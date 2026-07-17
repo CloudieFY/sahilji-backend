@@ -3,7 +3,7 @@ const Customer = require('../models/Customer');
 // GET /api/customers
 exports.getCustomers = async (req, res) => {
   try {
-    const customers = await Customer.find().sort({ createdAt: -1 });
+    const customers = await Customer.find().sort({ createdAt: -1 }).lean();
     res.json(customers);
   } catch (err) {
     res.status(500).json({ error: err.message });

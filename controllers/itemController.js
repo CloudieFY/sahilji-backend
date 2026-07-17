@@ -7,7 +7,7 @@ exports.getItems = async (req, res) => {
   try {
     const { status } = req.query;
     const query = status ? { status } : {};
-    const items = await Item.find(query).sort({ createdAt: -1 });
+    const items = await Item.find(query).sort({ createdAt: -1 }).lean();
     res.json(items);
   } catch (err) {
     res.status(500).json({ error: err.message });

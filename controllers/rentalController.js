@@ -6,7 +6,10 @@ const { RentalStatus, ItemStatus } = require('../types');
 // GET /api/rentals
 exports.getRentals = async (req, res) => {
   try {
-    const rentals = await Rental.find().populate('item customer').sort({ createdAt: -1 });
+    // .lean() skips Mongoose document hydration (change tracking, getters,
+    // virtuals) - this response is read-only JSON for the frontend, never
+    // mutated/saved, so the hydration overhead was pure waste on every refresh.
+    const rentals = await Rental.find().populate('item customer').sort({ createdAt: -1 }).lean();
     res.json(rentals);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -289,19 +292,36 @@ exports.updateRental = async (req, res) => {
     if (updates.lostQuantity != null) {
       updates.lostQuantity = Math.max(0, Number(updates.lostQuantity) || 0);
     }
+    // Fetch the rental ONCE (populated) and reuse it for both the payments-routing
+    // decision and the main update below - the old code queried this same document
+    // twice (once via customId alone, again via customId+populate), and every save
+    // paid for that duplicate round trip.
+    const rental = await Rental.findOne({ customId: req.params.id }).populate('item customer');
+    if (!rental) return res.status(404).json({ error: 'Rental not found' });
+
     if (updates.payments && Array.isArray(updates.payments)) {
       const newPayments = updates.payments.map(p => ({ amount: Number(p.amount), date: p.date ? new Date(p.date) : new Date() }));
       const newAdvance = newPayments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
-      
-      const rentalBeingUpdated = await Rental.findOne({ customId: req.params.id });
-      if (rentalBeingUpdated && rentalBeingUpdated.billNo) {
-        // Find the representative rental for the bill (the one holding the security deposit/payments).
-        // Tie-break on _id (monotonic, always unique) so this never disagrees with the
-        // frontend's getBillRepresentative when multiple pieces share a createdAt timestamp.
-        const billRep = await Rental.findOne({ billNo: rentalBeingUpdated.billNo, securityAmount: { $gt: 0 } }).sort({ createdAt: 1, _id: 1 })
-          || await Rental.findOne({ billNo: rentalBeingUpdated.billNo }).sort({ createdAt: 1, _id: 1 });
-        
-        if (billRep && billRep.customId !== rentalBeingUpdated.customId) {
+
+      if (rental.billNo) {
+        // Find the representative rental for the bill (the one holding the security
+        // deposit/payments) in a SINGLE query instead of up to two sequential
+        // findOne calls - fetch every piece of the bill and pick in JS. Mirrors the
+        // frontend's getBillRepresentative exactly (securityAmount > 0, else
+        // earliest createdAt, tie-broken by _id) so they never disagree.
+        const billPieces = await Rental.find({ billNo: rental.billNo })
+          .select('customId securityAmount createdAt _id')
+          .lean();
+        const withSecurity = billPieces.filter((r) => Number(r.securityAmount) > 0);
+        const candidates = withSecurity.length > 0 ? withSecurity : billPieces;
+        const billRep = [...candidates].sort((a, b) => {
+          const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          if (at !== bt) return at - bt;
+          return String(a._id).localeCompare(String(b._id));
+        })[0];
+
+        if (billRep && billRep.customId !== rental.customId) {
           // If the updated rental is NOT the bill representative, move any real payments
           // onto the representative. IMPORTANT: only touch the representative when this
           // piece actually carries payments. An empty array here means "this sibling has
@@ -325,9 +345,6 @@ exports.updateRental = async (req, res) => {
         updates.advance = newAdvance;
       }
     }
-
-    const rental = await Rental.findOne({ customId: req.params.id }).populate('item customer');
-    if (!rental) return res.status(404).json({ error: 'Rental not found' });
 
     const oldStatus = rental.status;
     const oldPenalty = rental.penalty || 0;
@@ -386,8 +403,11 @@ exports.updateRental = async (req, res) => {
     }
 
     await rental.save();
-    const populatedRental = await Rental.findById(rental._id).populate('item customer');
-    res.json(populatedRental);
+    // rental.item/rental.customer are still populated documents at this point
+    // (.save() doesn't clear populated paths, and any item/customer mutations
+    // above happened on these same sub-documents) - no need to re-fetch by _id
+    // just to hand back the same data we already have in memory.
+    res.json(rental);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
