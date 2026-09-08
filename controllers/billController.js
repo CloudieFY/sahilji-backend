@@ -1,14 +1,13 @@
-const { getNextSequence } = require('../utils/counterModel');
+const { nextBillNo } = require('../utils/billNo');
 
 // GET /api/bills/next
-// Returns a sequential invoice/bill number like INV-001
+// Returns the next sequential bill number, matching the scheme used when a
+// rental is created without an explicit bill number (BILL-0001, ...).
 exports.getNextBillNo = async (req, res) => {
   try {
-    const seq = await getNextSequence('INV');
-    const billNo = `INV-${seq.toString().padStart(4, '0')}`;
+    const billNo = await nextBillNo();
     res.json({ billNo });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 };
-

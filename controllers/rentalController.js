@@ -2,6 +2,8 @@ const Rental = require('../models/Rental');
 const Item = require('../models/Item');
 const Customer = require('../models/Customer');
 const { RentalStatus, ItemStatus } = require('../types');
+const { resolveAuth } = require('../middlewares/auth');
+const { nextBillNo } = require('../utils/billNo');
 
 // GET /api/rentals
 exports.getRentals = async (req, res) => {
@@ -44,6 +46,8 @@ exports.createRental = async (req, res) => {
 
     // --- Pre-transaction Validation ---
     if (!pieces || pieces.length === 0) {
+      await session.abortTransaction();
+      session.endSession();
       return res.status(400).json({ error: 'At least one piece is required for a rental bill.' });
     }
 
@@ -55,21 +59,10 @@ exports.createRental = async (req, res) => {
       return res.status(404).json({ error: 'Customer not found' });
     }
 
-    // --- Bill Number Generation (moved to backend for performance) ---
-    let billNo = clientBillNo;
+    // --- Bill Number Generation (atomic counter, race-safe) ---
+    let billNo = (clientBillNo && String(clientBillNo).trim()) || '';
     if (!billNo) {
-      const lastRentalWithBillNo = await Rental.findOne({ billNo: { $regex: /^BILL-/ } })
-        .sort({ billNo: -1 })
-        .session(session);
-
-      let nextSeq = 1;
-      if (lastRentalWithBillNo && lastRentalWithBillNo.billNo) {
-        const match = lastRentalWithBillNo.billNo.match(/BILL-(\d+)/);
-        if (match) {
-          nextSeq = parseInt(match[1], 10) + 1;
-        }
-      }
-      billNo = `BILL-${String(nextSeq).padStart(4, "0")}`;
+      billNo = await nextBillNo(session);
     }
 
 
@@ -144,7 +137,8 @@ exports.createRental = async (req, res) => {
         lostQuantity: 0,
         securityReturned: false,
         securityReturnedAt: null,
-        startDate: new Date(deliveryDate), // Assuming startDate is same as deliveryDate
+        // startDate mirrors the delivery date; fall back to now when absent.
+        startDate: deliveryDate ? new Date(deliveryDate) : new Date(),
       });
 
       await rental.save({ session });
@@ -169,10 +163,12 @@ exports.createRental = async (req, res) => {
     const populatedRental = await Rental.findById(createdRentals[0]._id).populate('item customer');
     res.status(201).json(populatedRental);
   } catch (err) {
-    if (session.inTransaction()) {
-      await session.abortTransaction();
+    if (session) {
+      if (session.inTransaction()) {
+        await session.abortTransaction();
+      }
+      session.endSession();
     }
-    if (session) session.endSession();
     res.status(400).json({ error: err.message });
   }
 };
@@ -180,9 +176,7 @@ exports.createRental = async (req, res) => {
 // PATCH /api/rentals/:id
 exports.updateRental = async (req, res) => {
   try {
-    const userRole = String(req.get('x-user-role') || req.headers['x-user-role'] || '')
-      .trim()
-      .toLowerCase();
+    const userRole = resolveAuth(req).role;
     const updates = { ...req.body };
     const updateKeys = Object.keys(updates);
 
@@ -249,8 +243,8 @@ exports.updateRental = async (req, res) => {
       if (updates.drycleanCompleted === true && !updates.drycleanCompletedBy) {
         return res.status(400).json({ error: 'Employee name is required to mark dryclean as completed.' });
       }
-    } else if (userRole !== 'admin') {
-      return res.status(403).json({ error: 'Admin only' });
+    } else if (userRole !== 'admin' && userRole !== 'reception') {
+      return res.status(403).json({ error: 'Not authorised for this action' });
     }
 
     if (updates.adminReconfirmed === true && !updates.adminReconfirmedBy) {
@@ -364,12 +358,12 @@ exports.deleteRental = async (req, res) => {
         const remainingOpenRental = await Rental.findOne({
           _id: { $ne: rental._id },
           item: rental.item._id,
-          status: { $in: [RentalStatus.ACTIVE, RentalStatus.UPCOMING] }
+          status: { $in: [RentalStatus.ACTIVE, RentalStatus.OVERDUE, RentalStatus.UPCOMING] }
         });
 
         if (!remainingOpenRental) {
           rental.item.status = ItemStatus.AVAILABLE;
-        } else if (remainingOpenRental.status === RentalStatus.ACTIVE) {
+        } else if ([RentalStatus.ACTIVE, RentalStatus.OVERDUE].includes(remainingOpenRental.status)) {
           rental.item.status = ItemStatus.RENTED;
         } else {
           rental.item.status = ItemStatus.RESERVED;

@@ -5,7 +5,18 @@ const { CustomerTier } = require('../types');
 const customerSchema = new mongoose.Schema({
   customId: { type: String, required: true, unique: true },
   name: { type: String, required: true, maxlength: 100 },
-  email: { type: String, maxlength: 255, unique: true, sparse: true },
+  email: {
+    type: String,
+    maxlength: 255,
+    trim: true,
+    lowercase: true,
+    // Unique only among real, non-empty emails. Blank / missing emails are
+    // ignored so multiple customers can be added without an email.
+    index: {
+      unique: true,
+      partialFilterExpression: { email: { $type: 'string', $gt: '' } },
+    },
+  },
   phone: { type: String, required: true, maxlength: 40 },
   secondaryPhone: { type: String, maxlength: 40 },
   tier: { 

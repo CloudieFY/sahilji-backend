@@ -2,6 +2,15 @@ const Item = require('../models/Item');
 const { ItemStatus } = require('../types');
 const XLSX = require('xlsx');
 
+// Server-managed fields the client must never be able to overwrite directly.
+const PROTECTED_ITEM_FIELDS = ['_id', 'customId', 'timesRented', 'createdAt', 'updatedAt', '__v'];
+
+function stripProtected(body = {}) {
+  const out = { ...body };
+  for (const key of PROTECTED_ITEM_FIELDS) delete out[key];
+  return out;
+}
+
 // GET /api/items - list all or filter by status
 exports.getItems = async (req, res) => {
   try {
@@ -41,8 +50,8 @@ exports.updateItem = async (req, res) => {
   try {
     const item = await Item.findOneAndUpdate(
       { customId: req.params.id },
-      req.body,
-      { new: true }
+      stripProtected(req.body),
+      { new: true, runValidators: true }
     );
     if (!item) return res.status(404).json({ error: 'Item not found' });
     res.json(item);

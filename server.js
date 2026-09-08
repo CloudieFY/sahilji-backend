@@ -7,7 +7,7 @@ const multer = require('multer');
 dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 5002;
 
 let dbReady = false;
 let dbError = null;
@@ -51,11 +51,12 @@ app.use('/api', (req, res, next) => {
 
 // Routes
 const authController = require('./controllers/authController');
+const requireAdmin = require('./middlewares/requireAdmin');
 
-// Staff management endpoints
-app.get('/api/auth/users', authController.getUsers);
-app.put('/api/auth/users/:identifier/status', authController.updateUserStatus);
-app.delete('/api/auth/users/:identifier', authController.deleteUser);
+// Staff management endpoints (admin only)
+app.get('/api/auth/users', requireAdmin, authController.getUsers);
+app.put('/api/auth/users/:identifier/status', requireAdmin, authController.updateUserStatus);
+app.delete('/api/auth/users/:identifier', requireAdmin, authController.deleteUser);
 
 // Auth routes
 function safeRequire(routePath) {

@@ -1,9 +1,15 @@
 const bcrypt = require('bcryptjs');
 const User = require('../models/User');
+const { signToken } = require('../utils/authToken');
 
 function normalizePhone(input) {
   return String(input || '').trim();
 }
+
+// Admin credentials live in env now (with a fallback to the previously
+// hard-coded frontend values so nothing breaks before .env is updated).
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || '90394 89995';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'arihant@55';
 
 // POST /api/auth/signup
 exports.signup = async (req, res) => {
@@ -50,6 +56,34 @@ exports.signup = async (req, res) => {
       status: user.status,
       phone: user.phone,
       email: user.email,
+      // Only issue a token if the account is already usable.
+      token:
+        user.status === 'active'
+          ? signToken({ id: String(user._id), role: user.role, name: user.name })
+          : undefined,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+};
+
+// POST /api/auth/admin-login
+exports.adminLogin = async (req, res) => {
+  try {
+    const { username, password } = req.body || {};
+    const u = String(username || '').trim();
+    const p = String(password || '').trim();
+
+    if (u !== ADMIN_USERNAME || p !== ADMIN_PASSWORD) {
+      return res.status(401).json({ error: 'Invalid admin credentials.' });
+    }
+
+    res.json({
+      id: 'admin',
+      name: 'Admin',
+      role: 'admin',
+      status: 'active',
+      token: signToken({ id: 'admin', role: 'admin', name: 'Admin' }),
     });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -92,6 +126,7 @@ exports.login = async (req, res) => {
       status: user.status,
       phone: user.phone,
       email: user.email,
+      token: signToken({ id: String(user._id), role: user.role, name: user.name }),
     });
   } catch (err) {
     res.status(400).json({ error: err.message });
