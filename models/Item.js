@@ -8,7 +8,7 @@ const itemSchema = new mongoose.Schema({
   designer: { type: String, required: true, maxlength: 60 },
   category: { type: String, required: true, maxlength: 20 },
   subcategory: { type: String, default: '', maxlength: 40 },
-  size: { type: String, required: true, maxlength: 8 },
+  size: { type: String, required: true, maxlength: 16 },
   color: { type: String, required: true, maxlength: 30 },
   pricePerDay: { type: Number, required: true, min: 0 },
   retailValue: { type: Number, required: true, min: 0 },
