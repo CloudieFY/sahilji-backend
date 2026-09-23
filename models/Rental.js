@@ -6,10 +6,15 @@ const Customer = require('./Customer');
 
 const rentalSchema = new mongoose.Schema({
   customId: { type: String, required: true, unique: true },
-  item: { type: mongoose.Schema.Types.ObjectId, ref: 'Item', required: true },
+  // Indexed - queried on every status change to find other open rentals for the
+  // same piece (item availability lookups in create/update/delete).
+  item: { type: mongoose.Schema.Types.ObjectId, ref: 'Item', required: true, index: true },
   customer: { type: mongoose.Schema.Types.ObjectId, ref: 'Customer', required: true },
   itemNo: { type: String, default: '' },
-  billNo: { type: String, default: '' },
+  // Looked up on nearly every save (bill-representative resolution) and every
+  // multi-item bill view - without an index this becomes a full collection scan
+  // as the rentals collection grows.
+  billNo: { type: String, default: '', index: true },
   address: { type: String, default: '' },
   deliveryDate: { type: Date, default: null },
   deliveryTimePeriod: { type: String, enum: ['Morning', 'Afternoon', 'Evening', 'Night', ''], default: '' },
@@ -19,6 +24,10 @@ const rentalSchema = new mongoose.Schema({
   lostQuantity: { type: Number, default: 0, min: 0 },
   discount: { type: Number, default: 0, min: 0 },
   penalty: { type: Number, default: 0, min: 0 },
+  payments: [{
+    amount: { type: Number, default: 0, min: 0 },
+    date: { type: Date, default: null },
+  }],
   remark: { type: String, default: '' },
   remarkCompleted: { type: Boolean, default: false },
   remarkConfirmedBy: { type: String, default: '' },

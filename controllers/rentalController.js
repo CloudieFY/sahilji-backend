@@ -8,7 +8,10 @@ const { nextBillNo } = require('../utils/billNo');
 // GET /api/rentals
 exports.getRentals = async (req, res) => {
   try {
-    const rentals = await Rental.find().populate('item customer').sort({ createdAt: -1 });
+    // .lean() skips Mongoose document hydration (change tracking, getters,
+    // virtuals) - this response is read-only JSON for the frontend, never
+    // mutated/saved, so the hydration overhead was pure waste on every refresh.
+    const rentals = await Rental.find().populate('item customer').sort({ createdAt: -1 }).lean();
     res.json(rentals);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -37,7 +40,7 @@ exports.createRental = async (req, res) => {
       customerId,
       billNo: clientBillNo, // Use a different name to avoid confusion
       address,
-      advance = 0,
+      payments: clientPayments = [], // This was already here, no change needed.
       discount: billDiscount = 0, // Bill-level discount
       securityAmount = 0,
       signature = '',
@@ -51,6 +54,16 @@ exports.createRental = async (req, res) => {
       return res.status(400).json({ error: 'At least one piece is required for a rental bill.' });
     }
 
+    // --- Duplicate Item Validation ---
+    const itemIds = new Set();
+    for (const piece of pieces) {
+      if (itemIds.has(piece.itemId)) {
+        await session.abortTransaction();
+        session.endSession();
+        return res.status(400).json({ error: `Duplicate item ID ${piece.itemId} found in the bill.` });
+      }
+      itemIds.add(piece.itemId);
+    }
     // --- Customer Validation ---
     const customer = await Customer.findOne({ customId: customerId }).session(session);
     if (!customer) {
@@ -104,10 +117,16 @@ exports.createRental = async (req, res) => {
 
       // Calculate total for this specific piece, including its discount, penalty, and shared advance/security
       const pieceSubTotal = (Number(rate) || 0) * (Number(quantity) || 1);
-      // Assign the entire bill discount to the first item only.
-      const pieceDiscount = index === 0 ? billDiscount : 0;
-      const pieceAdvance = index === 0 ? (Number(advance) || 0) : 0;
+
+      // Bill-level discount is only stored on the first piece.
+      const pieceDiscount = index === 0 ? (Number(billDiscount) || 0) : 0;
+
+      // Payments, advance, and security are bill-level (kept on the first piece only for record-keeping).
+      const billAdvance = (clientPayments || []).reduce((sum, p) => sum + Number(p.amount || 0), 0);
+      const piecePayments = index === 0 ? (clientPayments || []).map(p => ({ amount: Number(p.amount), date: p.date ? new Date(p.date) : new Date() })) : [];
       const pieceSecurityAmount = index === 0 ? (Number(securityAmount) || 0) : 0;
+      const pieceAdvance = index === 0 ? billAdvance : 0;
+      
       let pieceFinalTotal = pieceSubTotal - pieceDiscount + (Number(penalty) || 0) + pieceSecurityAmount;
       totalBillAmountAfterDiscount += pieceFinalTotal;
 
@@ -116,6 +135,7 @@ exports.createRental = async (req, res) => {
         customer: customer._id,
         billNo,
         address,
+        payments: piecePayments, // Save the advance payments
         advance: pieceAdvance,
         securityAmount: pieceSecurityAmount,
         signature,
@@ -124,7 +144,7 @@ exports.createRental = async (req, res) => {
         itemNo: itemNo || item.customId,
         deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
         deliveryTimePeriod: deliveryTimePeriod || '',
-        discount: pieceDiscount, // Store piece-level discount
+        discount: pieceDiscount, // Store bill-level discount on the first piece
         penalty: Number(penalty) || 0, // Store piece-level penalty
         endDate: new Date(endDate),
         endTimePeriod: endTimePeriod || '',
@@ -132,7 +152,7 @@ exports.createRental = async (req, res) => {
         quantity: Math.max(1, Number(quantity) || 1),
         remark,
         status: normalizedStatus,
-        total: pieceFinalTotal, // Store the final total after discount/penalty
+        total: pieceSubTotal + (Number(penalty) || 0), // Store the piece total (subtotal + penalty). Discount is now separate.
         // Default values for other fields
         lostQuantity: 0,
         securityReturned: false,
@@ -227,13 +247,13 @@ exports.updateRental = async (req, res) => {
     });
 
     const allowedEmployeeUpdates = ['remarkCompleted', 'remarkConfirmedBy', 'drycleanCompleted', 'drycleanCompletedBy'];
-    const allowedEmployeeDeliveryUpdates = ['status', 'advance', 'securityReturned', 'securityReturnedAt', 'returnedAt'];
+    const allowedEmployeeDeliveryUpdates = ['status', 'payments', 'securityReturned', 'securityReturnedAt', 'returnedAt'];
     const isReadyUpdate = updateKeys.length > 0 && updateKeys.every(update => allowedEmployeeUpdates.includes(update));
     const isDeliveryUpdate = updateKeys.length > 0 && updateKeys.every(update =>
       [...allowedEmployeeUpdates, ...allowedEmployeeDeliveryUpdates].includes(update)
     );
 
-    if (userRole === 'employee') {
+    if (userRole === 'employee' || userRole === 'reception') {
       if (!isReadyUpdate && !isDeliveryUpdate) {
         return res.status(403).json({ error: 'Employees can only update rental readiness, dryclean completion, or delivery/return status.' });
       }
@@ -266,8 +286,59 @@ exports.updateRental = async (req, res) => {
     if (updates.lostQuantity != null) {
       updates.lostQuantity = Math.max(0, Number(updates.lostQuantity) || 0);
     }
+    // Fetch the rental ONCE (populated) and reuse it for both the payments-routing
+    // decision and the main update below - the old code queried this same document
+    // twice (once via customId alone, again via customId+populate), and every save
+    // paid for that duplicate round trip.
     const rental = await Rental.findOne({ customId: req.params.id }).populate('item customer');
     if (!rental) return res.status(404).json({ error: 'Rental not found' });
+
+    if (updates.payments && Array.isArray(updates.payments)) {
+      const newPayments = updates.payments.map(p => ({ amount: Number(p.amount), date: p.date ? new Date(p.date) : new Date() }));
+      const newAdvance = newPayments.reduce((sum, p) => sum + Number(p.amount || 0), 0);
+
+      if (rental.billNo) {
+        // Find the representative rental for the bill (the one holding the security
+        // deposit/payments) in a SINGLE query instead of up to two sequential
+        // findOne calls - fetch every piece of the bill and pick in JS. Mirrors the
+        // frontend's getBillRepresentative exactly (securityAmount > 0, else
+        // earliest createdAt, tie-broken by _id) so they never disagree.
+        const billPieces = await Rental.find({ billNo: rental.billNo })
+          .select('customId securityAmount createdAt _id')
+          .lean();
+        const withSecurity = billPieces.filter((r) => Number(r.securityAmount) > 0);
+        const candidates = withSecurity.length > 0 ? withSecurity : billPieces;
+        const billRep = [...candidates].sort((a, b) => {
+          const at = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+          const bt = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+          if (at !== bt) return at - bt;
+          return String(a._id).localeCompare(String(b._id));
+        })[0];
+
+        if (billRep && billRep.customId !== rental.customId) {
+          // If the updated rental is NOT the bill representative, move any real payments
+          // onto the representative. IMPORTANT: only touch the representative when this
+          // piece actually carries payments. An empty array here means "this sibling has
+          // no payments" (the norm for multi-item bills) and must NOT wipe the
+          // representative's advance — doing so made the balance stop deducting payments.
+          if (newPayments.length > 0) {
+            await Rental.updateOne({ _id: billRep._id }, { payments: newPayments, advance: newAdvance });
+          }
+          // Remove payments from the current piece to avoid duplication, as they are
+          // stored on the representative.
+          updates.payments = [];
+          updates.advance = 0;
+        } else {
+          // If the updated rental IS the bill representative, just let the main update handle it.
+          updates.payments = newPayments;
+          updates.advance = newAdvance;
+        }
+      } else {
+        // This is a single rental, not part of a bill.
+        updates.payments = newPayments;
+        updates.advance = newAdvance;
+      }
+    }
 
     const oldStatus = rental.status;
     const oldPenalty = rental.penalty || 0;
@@ -326,8 +397,11 @@ exports.updateRental = async (req, res) => {
     }
 
     await rental.save();
-    const populatedRental = await Rental.findById(rental._id).populate('item customer');
-    res.json(populatedRental);
+    // rental.item/rental.customer are still populated documents at this point
+    // (.save() doesn't clear populated paths, and any item/customer mutations
+    // above happened on these same sub-documents) - no need to re-fetch by _id
+    // just to hand back the same data we already have in memory.
+    res.json(rental);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
