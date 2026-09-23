@@ -1,8 +1,10 @@
+const path = require('path');
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
 const cors = require('cors');
 const multer = require('multer');
+const compression = require('compression');
 
 dotenv.config();
 
@@ -12,6 +14,9 @@ const PORT = process.env.PORT || 5002;
 let dbReady = false;
 let dbError = null;
 
+// Gzip all responses (JSON API payloads compress very well).
+app.use(compression());
+
 // Middleware
 app.use(cors({
   origin: true, // Dynamically reflects your frontend origin (fixes port mismatches like 5174)
@@ -19,6 +24,17 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
+
+// Uploaded item images (served straight from disk; nginx also serves this path
+// directly in production, this is the fallback / dev path).
+app.use(
+  '/uploads',
+  express.static(path.join(__dirname, 'uploads'), {
+    maxAge: '30d',
+    immutable: true,
+    fallthrough: false,
+  }),
+);
 
 // Home Route
 app.get("/", (req, res) => {
@@ -35,16 +51,39 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Resolve once the DB is ready, or after `timeoutMs` (resolving to the current
+// readiness). Lets a request briefly wait out a cold start / reconnect instead
+// of failing instantly with 503.
+function waitForDb(timeoutMs) {
+  if (dbReady) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const interval = setInterval(() => {
+      if (dbReady) finish(true);
+    }, 200);
+    const timer = setTimeout(() => finish(dbReady), timeoutMs);
+    function finish(value) {
+      clearInterval(interval);
+      clearTimeout(timer);
+      resolve(value);
+    }
+  });
+}
+
 // API middleware
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   console.log(`[api] ${req.method} ${req.originalUrl}`);
 
-  if (dbReady) {
-    next();
-    return;
+  if (dbReady) return next();
+
+  // Permanent misconfiguration — no point waiting.
+  if (dbError && /MONGODB_URI is missing/.test(dbError)) {
+    return res.status(503).json({ error: dbError });
   }
 
-  res.status(503).json({
+  const ready = await waitForDb(12000);
+  if (ready) return next();
+
+  return res.status(503).json({
     error: dbError || 'Database is still connecting. Please try again in a moment.',
   });
 });
@@ -94,22 +133,48 @@ app.listen(PORT, () => {
 });
 
 // MongoDB Connect
-if (!process.env.MONGODB_URI) {
+mongoose.connection.on('connected', () => {
+  dbReady = true;
+  dbError = null;
+  console.log('[DB] connected to MongoDB Atlas');
+});
+mongoose.connection.on('disconnected', () => {
   dbReady = false;
-  dbError = 'MONGODB_URI is missing in .env file';
+  console.warn('[DB] disconnected — driver will attempt to reconnect');
+});
+mongoose.connection.on('reconnected', () => {
+  dbReady = true;
+  dbError = null;
+  console.log('[DB] reconnected');
+});
+mongoose.connection.on('error', (err) => {
+  dbError = `MongoDB error: ${err.message}`;
   console.error('[DB] ' + dbError);
-} else {
-  mongoose.connect(process.env.MONGODB_URI)
-    .then(() => {
-      dbReady = true;
-      dbError = null;
-      console.log('Connected to MongoDB Atlas');
-    })
-    .catch((err) => {
-      dbReady = false;
-      dbError = `MongoDB connection error: ${err.message}`;
-      console.error(dbError);
+});
+
+async function connectDB() {
+  if (!process.env.MONGODB_URI) {
+    dbReady = false;
+    dbError = 'MONGODB_URI is missing in .env file';
+    console.error('[DB] ' + dbError);
+    return;
+  }
+  try {
+    await mongoose.connect(process.env.MONGODB_URI, {
+      serverSelectionTimeoutMS: 8000,
+      socketTimeoutMS: 45000,
+      maxPoolSize: 10,
+      minPoolSize: 1,
     });
+    // 'connected' event handles the success flags.
+  } catch (err) {
+    dbReady = false;
+    dbError = `MongoDB connection error: ${err.message}`;
+    console.error('[DB] ' + dbError + ' — retrying in 5s');
+    setTimeout(connectDB, 5000);
+  }
 }
+
+connectDB();
 
 module.exports = app;

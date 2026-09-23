@@ -22,6 +22,8 @@ const upload = multer({
 const requireAdmin = require('../middlewares/requireAdmin');
 
 router.get('/', itemController.getItems);
+// Must be registered before '/:id' so it isn't captured as an id param.
+router.get('/images', itemController.getItemImages);
 
 
 // Admin-only: add/update inventory

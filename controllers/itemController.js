@@ -1,6 +1,7 @@
 const Item = require('../models/Item');
 const { ItemStatus } = require('../types');
 const XLSX = require('xlsx');
+const { persistImage, persistImages } = require('../utils/imageStore');
 
 // Server-managed fields the client must never be able to overwrite directly.
 const PROTECTED_ITEM_FIELDS = ['_id', 'customId', 'timesRented', 'createdAt', 'updatedAt', '__v'];
@@ -12,12 +13,29 @@ function stripProtected(body = {}) {
 }
 
 // GET /api/items - list all or filter by status
+// The heavy base64 `image` field is intentionally excluded here so the list
+// payload stays small (was ~18MB for ~60 items). Clients load images lazily
+// via GET /api/items/:id or in bulk via GET /api/items/images.
 exports.getItems = async (req, res) => {
   try {
-    const { status } = req.query;
+    const { status, images } = req.query;
     const query = status ? { status } : {};
-    const items = await Item.find(query).sort({ createdAt: -1 }).lean();
+    let q = Item.find(query).sort({ createdAt: -1 });
+    if (images !== '1' && images !== 'true') {
+      q = q.select('-image');
+    }
+    const items = await q.lean();
     res.json(items);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/items/images - bulk map of { customId, image } for lazy hydration.
+exports.getItemImages = async (req, res) => {
+  try {
+    const items = await Item.find({}, { customId: 1, image: 1, _id: 0 }).lean();
+    res.json(items.filter((it) => it.image));
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -37,7 +55,10 @@ exports.getItem = async (req, res) => {
 // POST /api/items
 exports.createItem = async (req, res) => {
   try {
-    const item = new Item(req.body);
+    const body = { ...req.body };
+    if (body.image !== undefined) body.image = await persistImage(body.image);
+    if (body.images !== undefined) body.images = await persistImages(body.images);
+    const item = new Item(body);
     await item.save();
     res.status(201).json(item);
   } catch (err) {
@@ -48,9 +69,12 @@ exports.createItem = async (req, res) => {
 // PATCH /api/items/:id
 exports.updateItem = async (req, res) => {
   try {
+    const updates = stripProtected(req.body);
+    if (updates.image !== undefined) updates.image = await persistImage(updates.image);
+    if (updates.images !== undefined) updates.images = await persistImages(updates.images);
     const item = await Item.findOneAndUpdate(
       { customId: req.params.id },
-      stripProtected(req.body),
+      updates,
       { new: true, runValidators: true }
     );
     if (!item) return res.status(404).json({ error: 'Item not found' });
@@ -123,7 +147,7 @@ exports.uploadExcel = async (req, res) => {
           pricePerDay: parseFloat(row.pricePerDay || row['Price Per Day'] || row.price_per_day),
           retailValue: parseFloat(row.retailValue || row['Retail Value'] || row.retail_value),
           quantity: Math.max(0, parseInt(row.quantity || row.Quantity || row.qty || row.Qty || 1, 10) || 1),
-          image: row.image || row.Image || '',
+          image: await persistImage(row.image || row.Image || ''),
           status: ItemStatus.AVAILABLE,
           timesRented: 0
         };

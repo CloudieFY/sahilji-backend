@@ -8,10 +8,13 @@ const { nextBillNo } = require('../utils/billNo');
 // GET /api/rentals
 exports.getRentals = async (req, res) => {
   try {
-    // .lean() skips Mongoose document hydration (change tracking, getters,
-    // virtuals) - this response is read-only JSON for the frontend, never
-    // mutated/saved, so the hydration overhead was pure waste on every refresh.
-    const rentals = await Rental.find().populate('item customer').sort({ createdAt: -1 }).lean();
+    // Exclude the heavy base64 item `image` from the populated item.
+    // The frontend renders item images from the items store, not from here.
+    const rentals = await Rental.find()
+      .populate({ path: 'item', select: '-image' })
+      .populate('customer')
+      .sort({ createdAt: -1 })
+      .lean();
     res.json(rentals);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -21,7 +24,10 @@ exports.getRentals = async (req, res) => {
 // GET /api/rentals/:id
 exports.getRental = async (req, res) => {
   try {
-    const rental = await Rental.findOne({ customId: req.params.id }).populate('item customer');
+    const rental = await Rental.findOne({ customId: req.params.id })
+      .populate({ path: 'item', select: '-image' })
+      .populate('customer')
+      .lean();
     if (!rental) return res.status(404).json({ error: 'Rental not found' });
     res.json(rental);
   } catch (err) {
