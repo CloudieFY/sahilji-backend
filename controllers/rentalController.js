@@ -281,7 +281,20 @@ exports.updateRental = async (req, res) => {
     });
 
     const allowedEmployeeUpdates = ['remarkCompleted', 'remarkConfirmedBy', 'drycleanCompleted', 'drycleanCompletedBy'];
-    const allowedEmployeeDeliveryUpdates = ['status', 'payments', 'securityReturned', 'securityReturnedAt', 'returnedAt'];
+    const allowedEmployeeDeliveryUpdates = [
+      'status',
+      'payments',
+      'securityReturned',
+      'securityReturnedAt',
+      'securityRefundNote',
+      'securityRefundDeduction',
+      'returnedAt',
+      'cancellationCharge',
+      'cancellationReason',
+      'cancelledAt',
+      'refundAmount',
+      'refundPaid',
+    ];
     const isReadyUpdate = updateKeys.length > 0 && updateKeys.every(update => allowedEmployeeUpdates.includes(update));
     const isDeliveryUpdate = updateKeys.length > 0 && updateKeys.every(update =>
       [...allowedEmployeeUpdates, ...allowedEmployeeDeliveryUpdates].includes(update)
@@ -411,7 +424,7 @@ exports.updateRental = async (req, res) => {
         rental.item.status = ItemStatus.RENTED;
       } else if (updates.status === RentalStatus.UPCOMING) {
         rental.item.status = ItemStatus.RESERVED;
-      } else if (updates.status === RentalStatus.RETURNED) {
+      } else if (updates.status === RentalStatus.RETURNED || updates.status === RentalStatus.CANCELLED) {
         const otherOpenRental = await Rental.findOne({
           _id: { $ne: rental._id },
           item: rental.item._id,
@@ -541,3 +554,130 @@ exports.deleteRental = async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 };
+
+// POST /api/rentals/:id/cancel
+exports.cancelRental = async (req, res) => {
+  const { id } = req.params;
+  const {
+    cancellationCharge = 0,
+    cancellationReason = '',
+    refundPaid = true,
+    cancelEntireBill = true,
+  } = req.body;
+
+  try {
+    const userRole = resolveAuth(req).role;
+    if (userRole !== 'admin' && userRole !== 'reception') {
+      return res.status(403).json({ error: 'Not authorised to cancel orders' });
+    }
+
+    const targetRental = await Rental.findOne({ customId: id }).populate('item customer');
+    if (!targetRental) {
+      return res.status(404).json({ error: 'Rental not found' });
+    }
+
+    let rentalsToCancel = [];
+    if (cancelEntireBill && targetRental.billNo) {
+      rentalsToCancel = await Rental.find({ billNo: targetRental.billNo }).populate('item customer');
+    } else {
+      rentalsToCancel = [targetRental];
+    }
+
+    if (rentalsToCancel.length === 0) {
+      return res.status(404).json({ error: 'No rentals found to cancel' });
+    }
+
+    // Orders that have already been returned cannot be cancelled
+    const hasReturnedPiece = rentalsToCancel.some((r) => r.status === RentalStatus.RETURNED);
+    if (hasReturnedPiece) {
+      return res.status(400).json({ error: 'Returned orders cannot be cancelled (वापस हो चुका ऑर्डर कैंसिल नहीं किया जा सकता)' });
+    }
+
+    // Calculate total payments / advance received for this bill/rental
+    let totalPaid = 0;
+    for (const r of rentalsToCancel) {
+      if (Array.isArray(r.payments) && r.payments.length > 0) {
+        totalPaid += r.payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+      } else if (Number(r.advance) > 0) {
+        totalPaid += Number(r.advance);
+      }
+    }
+
+    const charge = Math.max(0, Number(cancellationCharge) || 0);
+    const refund = Math.max(0, totalPaid - charge);
+    const now = new Date();
+
+    // Identify the representative piece to hold the cancellation charge and refund details
+    const repRental =
+      rentalsToCancel.find((r) => Number(r.securityAmount) > 0) ||
+      rentalsToCancel.find((r) => r.customId === id) ||
+      rentalsToCancel[0];
+
+    let totalRentalsValue = 0;
+
+    for (const rental of rentalsToCancel) {
+      totalRentalsValue += Number(rental.total) || 0;
+      const oldStatus = rental.status;
+      rental.status = RentalStatus.CANCELLED;
+      rental.cancelledAt = now;
+      rental.cancellationReason = cancellationReason || '';
+
+      const isRep = String(rental._id) === String(repRental._id);
+      if (isRep) {
+        rental.cancellationCharge = charge;
+        rental.refundAmount = refund;
+        rental.refundPaid = Boolean(refundPaid);
+      } else {
+        rental.cancellationCharge = 0;
+        rental.refundAmount = 0;
+        rental.refundPaid = false;
+      }
+
+      // Free up item inventory
+      if (rental.item) {
+        if ([RentalStatus.ACTIVE, RentalStatus.UPCOMING, RentalStatus.OVERDUE].includes(oldStatus)) {
+          rental.item.timesRented = Math.max(0, (rental.item.timesRented || 1) - 1);
+        }
+
+        const remainingOpenRental = await Rental.findOne({
+          _id: { $ne: rental._id },
+          item: rental.item._id,
+          status: { $in: [RentalStatus.ACTIVE, RentalStatus.OVERDUE, RentalStatus.UPCOMING] },
+        });
+
+        if (!remainingOpenRental) {
+          rental.item.status = ItemStatus.AVAILABLE;
+        } else if ([RentalStatus.ACTIVE, RentalStatus.OVERDUE].includes(remainingOpenRental.status)) {
+          rental.item.status = ItemStatus.RENTED;
+        } else {
+          rental.item.status = ItemStatus.RESERVED;
+        }
+        await rental.item.save();
+      }
+
+      await rental.save();
+    }
+
+    // Adjust customer stats
+    const primaryCustomer = targetRental.customer;
+    if (primaryCustomer) {
+      primaryCustomer.rentals = Math.max(0, (primaryCustomer.rentals || 0) - rentalsToCancel.length);
+      primaryCustomer.totalSpent = Math.max(0, (primaryCustomer.totalSpent || 0) - totalRentalsValue + charge);
+      await primaryCustomer.save();
+    }
+
+    res.json({
+      message: 'Rental order cancelled successfully',
+      billNo: targetRental.billNo || targetRental.customId,
+      cancellationCharge: charge,
+      totalPaid,
+      refundAmount: refund,
+      refundPaid: Boolean(refundPaid),
+      cancelledCount: rentalsToCancel.length,
+    });
+  } catch (err) {
+    console.error('[rentals] cancelRental error:', err);
+    res.status(500).json({ error: err.message });
+  }
+};
+

@@ -11,6 +11,7 @@ router.get('/', rentalController.getRentals);
 router.post('/', requireAdmin, rentalController.createRental);
 router.get('/:id', rentalController.getRental);
 router.patch('/:id', rentalController.updateRental);
+router.post('/:id/cancel', rentalController.cancelRental);
 router.delete('/:id', requireAdmin, rentalController.deleteRental);
 
 

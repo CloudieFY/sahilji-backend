@@ -11,7 +11,8 @@ const RentalStatus = {
   ACTIVE: 'active',
   UPCOMING: 'upcoming',
   RETURNED: 'returned',
-  OVERDUE: 'overdue'
+  OVERDUE: 'overdue',
+  CANCELLED: 'cancelled'
 };
 
 const CustomerTier = {
