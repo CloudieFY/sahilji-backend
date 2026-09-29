@@ -1,27 +1,54 @@
-const { getNextSequence } = require('./counterModel');
+const { Counter } = require('./counterModel');
 
 /**
- * Allocate the next bill number atomically via the shared Counter collection.
+ * Allocate the next sequential bill number.
  *
- * The previous approach regex-scanned rentals and sorted by string, which:
- *   - breaks after BILL-9999 (lexical sort: "BILL-9999" > "BILL-10000")
- *   - races under concurrent requests (two bills get the same number)
- *
- * A monotonic counter fixes both. We still verify against existing rentals so
- * numbers created by the old scheme can't be reused.
+ * Rules:
+ * 1. Checks all currently active bill numbers in the database.
+ * 2. If a bill was deleted (e.g. 1, 2, [3 deleted], 4), it reuses that lowest
+ *    available deleted number (e.g. 3) so numbers are not skipped.
+ * 3. When no bills are deleted or gaps exist, it always increases monotonically: 1, 2, 3, 4, 5, 6...
+ * 4. Syncs the Counter collection for consistency.
  */
 async function nextBillNo(session) {
   const Rental = require('../models/Rental');
-  for (let i = 0; i < 50; i += 1) {
-    const seq = await getNextSequence('BILL');
-    const billNo = `BILL-${String(seq).padStart(4, '0')}`;
-    const q = Rental.findOne({ billNo });
-    if (session) q.session(session);
-    // eslint-disable-next-line no-await-in-loop
-    const clash = await q;
-    if (!clash) return billNo;
+
+  const query = Rental.find({ billNo: { $exists: true, $ne: '' } }, 'billNo');
+  if (session) query.session(session);
+  const rentals = await query.lean();
+
+  const existingNums = new Set();
+  for (const r of rentals) {
+    if (!r.billNo) continue;
+    const match = String(r.billNo).match(/(\d+)/);
+    if (match) {
+      const num = parseInt(match[1], 10);
+      if (num > 0) {
+        existingNums.add(num);
+      }
+    }
   }
-  throw new Error('Could not allocate a unique bill number');
+
+  // Find the lowest positive integer starting at 1 that is not currently present
+  let nextSeq = 1;
+  while (existingNums.has(nextSeq)) {
+    nextSeq += 1;
+  }
+
+  const billNo = `BILL-${String(nextSeq).padStart(4, '0')}`;
+
+  try {
+    const highest = Math.max(0, ...existingNums, nextSeq);
+    await Counter.findOneAndUpdate(
+      { prefix: 'BILL' },
+      { $set: { seq: highest } },
+      { upsert: true }
+    );
+  } catch (err) {
+    // Non-fatal
+  }
+
+  return billNo;
 }
 
 module.exports = { nextBillNo };

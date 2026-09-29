@@ -115,6 +115,34 @@ exports.createRental = async (req, res) => {
         throw new Error(`Item with ID ${itemId} not found.`);
       }
 
+      // Check if item is already booked
+      const isSafa = (item.category && item.category.toLowerCase().includes('safa')) ||
+                     (item.name && item.name.toLowerCase().includes('safa'));
+      if (!isSafa) {
+        const pDelivery = piece.deliveryDate ? new Date(piece.deliveryDate) : null;
+        const pEnd = piece.endDate ? new Date(piece.endDate) : null;
+
+        const rentalConflictQuery = {
+          item: item._id,
+          status: { $in: [RentalStatus.ACTIVE, RentalStatus.UPCOMING, RentalStatus.OVERDUE] }
+        };
+
+        if (pDelivery && pEnd && !Number.isNaN(pDelivery.getTime()) && !Number.isNaN(pEnd.getTime())) {
+          rentalConflictQuery.$or = [
+            { status: RentalStatus.OVERDUE },
+            {
+              startDate: { $lte: pEnd },
+              endDate: { $gte: pDelivery }
+            }
+          ];
+        }
+
+        const conflict = await Rental.findOne(rentalConflictQuery).session(session);
+        if (conflict) {
+          throw new Error(`Item "${item.name}" (${item.customId}) is already booked.`);
+        }
+      }
+
       // --- Status Normalization ---
       let normalizedStatus = typeof status === 'string' ? status.toLowerCase() : RentalStatus.UPCOMING;
       if (!Object.values(RentalStatus).includes(normalizedStatus)) {

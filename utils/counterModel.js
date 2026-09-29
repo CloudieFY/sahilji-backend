@@ -20,4 +20,4 @@ function generateId(prefix, seq) {
   return `${prefix}-${seq.toString().padStart(3, '0')}`;
 }
 
-module.exports = { getNextSequence, generateId };
+module.exports = { getNextSequence, generateId, Counter };
