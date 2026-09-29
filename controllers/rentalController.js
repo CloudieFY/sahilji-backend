@@ -431,6 +431,54 @@ exports.deleteRental = async (req, res) => {
       return res.status(404).json({ error: 'Rental(s) not found' });
     }
 
+    // ── Bill-level data transfer ──────────────────────────────────────────────
+    // If we are deleting a single item (not a full bill wipe via billNo query)
+    // and that item is the bill representative (holds securityAmount / discount /
+    // payments), transfer those fields to the next oldest sibling so that no
+    // financial data is lost.
+    if (!billNo && rentalsToDelete.length === 1) {
+      const deletingRental = rentalsToDelete[0];
+      const hasFinancialData =
+        Number(deletingRental.securityAmount) > 0 ||
+        Number(deletingRental.discount) > 0 ||
+        (Array.isArray(deletingRental.payments) && deletingRental.payments.length > 0);
+
+      if (hasFinancialData && deletingRental.billNo) {
+        // Find remaining siblings sorted oldest-first (same selection as getBillRepresentative)
+        const siblings = await Rental.find({
+          billNo: deletingRental.billNo,
+          _id: { $ne: deletingRental._id },
+        }).sort({ createdAt: 1, _id: 1 });
+
+        if (siblings.length > 0) {
+          const newRep = siblings[0];
+          // Transfer bill-level fields only if the sibling doesn't already have them
+          const update = {};
+          if (Number(deletingRental.securityAmount) > 0 && !Number(newRep.securityAmount)) {
+            update.securityAmount = deletingRental.securityAmount;
+          }
+          if (Number(deletingRental.discount) > 0 && !Number(newRep.discount)) {
+            update.discount = deletingRental.discount;
+          }
+          if (
+            Array.isArray(deletingRental.payments) &&
+            deletingRental.payments.length > 0 &&
+            (!Array.isArray(newRep.payments) || newRep.payments.length === 0)
+          ) {
+            update.payments = deletingRental.payments;
+            update.advance = deletingRental.advance;
+          }
+          if (deletingRental.securityReturned !== undefined && newRep.securityReturned === undefined) {
+            update.securityReturned = deletingRental.securityReturned;
+          }
+          if (Object.keys(update).length > 0) {
+            await Rental.updateOne({ _id: newRep._id }, { $set: update });
+          }
+        }
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────────────
+
     for (const rental of rentalsToDelete) {
       // Rollback counters and restore item availability when no open rentals remain.
       if (rental.item) {
