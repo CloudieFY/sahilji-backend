@@ -389,13 +389,60 @@ exports.updateRental = async (req, res) => {
 
     const oldStatus = rental.status;
     const oldPenalty = rental.penalty || 0;
+
+    // Handle item update
+    if (updates.itemId || updates.item) {
+      const newItemIdentifier = updates.itemId || updates.item;
+      const newItem = await Item.findOne({
+        $or: [
+          { customId: newItemIdentifier },
+          ...(mongoose.Types.ObjectId.isValid(newItemIdentifier) ? [{ _id: newItemIdentifier }] : [])
+        ]
+      });
+      if (newItem) {
+        const oldItemId = rental.item?._id ? rental.item._id : rental.item;
+        rental.item = newItem._id;
+        rental.itemNo = updates.itemNo || newItem.customId;
+        delete updates.itemId;
+        delete updates.item;
+
+        if (oldItemId && String(oldItemId) !== String(newItem._id)) {
+          const oldItemOtherRentals = await Rental.findOne({
+            _id: { $ne: rental._id },
+            item: oldItemId,
+            status: { $in: [RentalStatus.ACTIVE, RentalStatus.OVERDUE, RentalStatus.UPCOMING] }
+          });
+          if (!oldItemOtherRentals) {
+            await Item.updateOne({ _id: oldItemId }, { status: ItemStatus.AVAILABLE });
+          }
+          if ([RentalStatus.ACTIVE, RentalStatus.OVERDUE].includes(rental.status)) {
+            newItem.status = ItemStatus.RENTED;
+          } else if (rental.status === RentalStatus.UPCOMING) {
+            newItem.status = ItemStatus.RESERVED;
+          }
+          await newItem.save();
+        }
+      }
+    }
+
+    if (updates.deliveryDate) {
+      rental.deliveryDate = new Date(updates.deliveryDate);
+      rental.startDate = new Date(updates.deliveryDate);
+    }
+    if (updates.endDate) {
+      rental.endDate = new Date(updates.endDate);
+    }
+
     Object.assign(rental, updates);
 
     // If an employee marked dryclean completed, set item status to CLEANING
     if (updates.drycleanCompleted === true && rental.item) {
       try {
-        rental.item.status = ItemStatus.CLEANING;
-        await rental.item.save();
+        const itm = await Item.findById(rental.item._id || rental.item);
+        if (itm) {
+          itm.status = ItemStatus.CLEANING;
+          await itm.save();
+        }
       } catch (err) {
         console.error('[rentals] failed to set item status to CLEANING', err);
       }
@@ -404,8 +451,11 @@ exports.updateRental = async (req, res) => {
     // If admin confirmed dryclean, mark item available
     if (updates.drycleanAdminConfirmed === true && rental.item) {
       try {
-        rental.item.status = ItemStatus.AVAILABLE;
-        await rental.item.save();
+        const itm = await Item.findById(rental.item._id || rental.item);
+        if (itm) {
+          itm.status = ItemStatus.AVAILABLE;
+          await itm.save();
+        }
       } catch (err) {
         console.error('[rentals] failed to set item status to AVAILABLE after dryclean confirm', err);
       }
@@ -420,35 +470,34 @@ exports.updateRental = async (req, res) => {
     }
 
     if (updates.status && updates.status !== oldStatus && rental.item) {
-      if ([RentalStatus.ACTIVE, RentalStatus.OVERDUE].includes(updates.status)) {
-        rental.item.status = ItemStatus.RENTED;
-      } else if (updates.status === RentalStatus.UPCOMING) {
-        rental.item.status = ItemStatus.RESERVED;
-      } else if (updates.status === RentalStatus.RETURNED || updates.status === RentalStatus.CANCELLED) {
-        const otherOpenRental = await Rental.findOne({
-          _id: { $ne: rental._id },
-          item: rental.item._id,
-          status: { $in: [RentalStatus.ACTIVE, RentalStatus.OVERDUE, RentalStatus.UPCOMING] },
-        }).sort({ createdAt: -1 });
+      const currentItemDoc = await Item.findById(rental.item._id || rental.item);
+      if (currentItemDoc) {
+        if ([RentalStatus.ACTIVE, RentalStatus.OVERDUE].includes(updates.status)) {
+          currentItemDoc.status = ItemStatus.RENTED;
+        } else if (updates.status === RentalStatus.UPCOMING) {
+          currentItemDoc.status = ItemStatus.RESERVED;
+        } else if (updates.status === RentalStatus.RETURNED || updates.status === RentalStatus.CANCELLED) {
+          const otherOpenRental = await Rental.findOne({
+            _id: { $ne: rental._id },
+            item: currentItemDoc._id,
+            status: { $in: [RentalStatus.ACTIVE, RentalStatus.OVERDUE, RentalStatus.UPCOMING] },
+          }).sort({ createdAt: -1 });
 
-        if (otherOpenRental?.status === RentalStatus.ACTIVE || otherOpenRental?.status === RentalStatus.OVERDUE) {
-          rental.item.status = ItemStatus.RENTED;
-        } else if (otherOpenRental?.status === RentalStatus.UPCOMING) {
-          rental.item.status = ItemStatus.RESERVED;
-        } else {
-          rental.item.status = ItemStatus.AVAILABLE;
+          if (otherOpenRental?.status === RentalStatus.ACTIVE || otherOpenRental?.status === RentalStatus.OVERDUE) {
+            currentItemDoc.status = ItemStatus.RENTED;
+          } else if (otherOpenRental?.status === RentalStatus.UPCOMING) {
+            currentItemDoc.status = ItemStatus.RESERVED;
+          } else {
+            currentItemDoc.status = ItemStatus.AVAILABLE;
+          }
         }
+        await currentItemDoc.save();
       }
-
-      await rental.item.save();
     }
 
     await rental.save();
-    // rental.item/rental.customer are still populated documents at this point
-    // (.save() doesn't clear populated paths, and any item/customer mutations
-    // above happened on these same sub-documents) - no need to re-fetch by _id
-    // just to hand back the same data we already have in memory.
-    res.json(rental);
+    const populated = await Rental.findById(rental._id).populate('item customer');
+    res.json(populated || rental);
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -595,17 +644,68 @@ exports.cancelRental = async (req, res) => {
 
     // Calculate total payments / advance received for this bill/rental
     let totalPaid = 0;
-    for (const r of rentalsToCancel) {
-      if (Array.isArray(r.payments) && r.payments.length > 0) {
-        totalPaid += r.payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
-      } else if (Number(r.advance) > 0) {
-        totalPaid += Number(r.advance);
+    if (cancelEntireBill) {
+      for (const r of rentalsToCancel) {
+        if (Array.isArray(r.payments) && r.payments.length > 0) {
+          totalPaid += r.payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        } else if (Number(r.advance) > 0) {
+          totalPaid += Number(r.advance);
+        }
+      }
+    } else {
+      // When cancelling a single item, check payments across the whole bill
+      const allBillRentals = targetRental.billNo
+        ? await Rental.find({ billNo: targetRental.billNo })
+        : [targetRental];
+      for (const r of allBillRentals) {
+        if (Array.isArray(r.payments) && r.payments.length > 0) {
+          totalPaid += r.payments.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+        } else if (Number(r.advance) > 0) {
+          totalPaid += Number(r.advance);
+        }
       }
     }
 
     const charge = Math.max(0, Number(cancellationCharge) || 0);
     const refund = Math.max(0, totalPaid - charge);
     const now = new Date();
+
+    // If cancelling a single item from a multi-item bill, ensure any bill-level
+    // financials (payments, advance, security, discount) on this item are transferred
+    // to an active sibling piece so the remaining active bill is not disturbed.
+    if (!cancelEntireBill && targetRental.billNo) {
+      const activeSiblings = await Rental.find({
+        billNo: targetRental.billNo,
+        _id: { $ne: targetRental._id },
+        status: { $ne: RentalStatus.CANCELLED },
+      }).sort({ createdAt: 1, _id: 1 });
+
+      if (activeSiblings.length > 0) {
+        const newRep = activeSiblings[0];
+        const update = {};
+        if (Number(targetRental.securityAmount) > 0 && !Number(newRep.securityAmount)) {
+          update.securityAmount = targetRental.securityAmount;
+          targetRental.securityAmount = 0;
+        }
+        if (Number(targetRental.discount) > 0 && !Number(newRep.discount)) {
+          update.discount = targetRental.discount;
+          targetRental.discount = 0;
+        }
+        if (
+          Array.isArray(targetRental.payments) &&
+          targetRental.payments.length > 0 &&
+          (!Array.isArray(newRep.payments) || newRep.payments.length === 0)
+        ) {
+          update.payments = targetRental.payments;
+          update.advance = targetRental.advance;
+          targetRental.payments = [];
+          targetRental.advance = 0;
+        }
+        if (Object.keys(update).length > 0) {
+          await Rental.updateOne({ _id: newRep._id }, { $set: update });
+        }
+      }
+    }
 
     // Identify the representative piece to hold the cancellation charge and refund details
     const repRental =
