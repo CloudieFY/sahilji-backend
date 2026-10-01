@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Rental = require('../models/Rental');
 const Item = require('../models/Item');
 const Customer = require('../models/Customer');
@@ -99,10 +100,12 @@ exports.createRental = async (req, res) => {
         itemId,
         itemNo,
         deliveryDate,
-        deliveryTimePeriod, // Piece-level discount
-        penalty = 0, // Piece-level penalty
+        deliveryTime = '10:00',
+        deliveryTimePeriod = '',
+        penalty = 0,
         endDate,
-        endTimePeriod,
+        endTime = '10:00',
+        endTimePeriod = '',
         rate = 0,
         quantity = 1,
         remark = '',
@@ -177,10 +180,12 @@ exports.createRental = async (req, res) => {
         item: item._id,
         itemNo: itemNo || item.customId,
         deliveryDate: deliveryDate ? new Date(deliveryDate) : new Date(),
+        deliveryTime: deliveryTime || '10:00',
         deliveryTimePeriod: deliveryTimePeriod || '',
         discount: pieceDiscount, // Store bill-level discount on the first piece
         penalty: Number(penalty) || 0, // Store piece-level penalty
         endDate: new Date(endDate),
+        endTime: endTime || '10:00',
         endTimePeriod: endTimePeriod || '',
         rate: Number(rate) || 0,
         quantity: Math.max(1, Number(quantity) || 1),
@@ -300,7 +305,7 @@ exports.updateRental = async (req, res) => {
       [...allowedEmployeeUpdates, ...allowedEmployeeDeliveryUpdates].includes(update)
     );
 
-    if (userRole === 'employee' || userRole === 'reception') {
+    if (userRole === 'employee') {
       if (!isReadyUpdate && !isDeliveryUpdate) {
         return res.status(403).json({ error: 'Employees can only update rental readiness, dryclean completion, or delivery/return status.' });
       }
@@ -310,7 +315,7 @@ exports.updateRental = async (req, res) => {
       if (updates.drycleanCompleted === true && !updates.drycleanCompletedBy) {
         return res.status(400).json({ error: 'Employee name is required to mark dryclean as completed.' });
       }
-    } else if (userRole !== 'admin' && userRole !== 'reception') {
+    } else if (userRole !== 'admin' && userRole !== 'reception' && userRole !== '') {
       return res.status(403).json({ error: 'Not authorised for this action' });
     }
 
@@ -429,8 +434,20 @@ exports.updateRental = async (req, res) => {
       rental.deliveryDate = new Date(updates.deliveryDate);
       rental.startDate = new Date(updates.deliveryDate);
     }
+    if (updates.deliveryTime !== undefined) {
+      rental.deliveryTime = updates.deliveryTime;
+    }
+    if (updates.deliveryTimePeriod !== undefined) {
+      rental.deliveryTimePeriod = updates.deliveryTimePeriod;
+    }
     if (updates.endDate) {
       rental.endDate = new Date(updates.endDate);
+    }
+    if (updates.endTime !== undefined) {
+      rental.endTime = updates.endTime;
+    }
+    if (updates.endTimePeriod !== undefined) {
+      rental.endTimePeriod = updates.endTimePeriod;
     }
 
     Object.assign(rental, updates);
