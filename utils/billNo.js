@@ -1,53 +1,59 @@
 const { Counter } = require('./counterModel');
 
 /**
- * Allocate the next sequential bill number.
- *
- * Rules:
- * 1. Checks all currently active bill numbers in the database.
- * 2. If a bill was deleted (e.g. 1, 2, [3 deleted], 4), it reuses that lowest
- *    available deleted number (e.g. 3) so numbers are not skipped.
- * 3. When no bills are deleted or gaps exist, it always increases monotonically: 1, 2, 3, 4, 5, 6...
- * 4. Syncs the Counter collection for consistency.
+ * Allocate the next sequential bill number strictly monotonically increasing.
+ * Once a bill number is used, it is NEVER reused even if deleted or cancelled.
+ * It will always increment from the highest bill number: (max + 1).
  */
 async function nextBillNo(session) {
   const Rental = require('../models/Rental');
 
+  // Find the highest bill number currently in database
   const query = Rental.find({ billNo: { $exists: true, $ne: '' } }, 'billNo');
   if (session) query.session(session);
   const rentals = await query.lean();
 
-  const existingNums = new Set();
+  let maxExisting = 0;
   for (const r of rentals) {
     if (!r.billNo) continue;
     const match = String(r.billNo).match(/(\d+)/);
     if (match) {
       const num = parseInt(match[1], 10);
-      if (num > 0) {
-        existingNums.add(num);
+      if (num > maxExisting) {
+        maxExisting = num;
       }
     }
   }
 
-  // Find the lowest positive integer starting at 1 that is not currently present
-  let nextSeq = 1;
-  while (existingNums.has(nextSeq)) {
-    nextSeq += 1;
+  // Atomically ensure Counter is at least maxExisting, then increment
+  const counterQuery = Counter.findOneAndUpdate(
+    { prefix: 'BILL' },
+    { $max: { seq: maxExisting } },
+    { upsert: true, new: true }
+  );
+  if (session) counterQuery.session(session);
+  await counterQuery;
+
+  const incQuery = Counter.findOneAndUpdate(
+    { prefix: 'BILL' },
+    { $inc: { seq: 1 } },
+    { upsert: true, new: true }
+  );
+  if (session) incQuery.session(session);
+  const updated = await incQuery;
+
+  const nextSeq = Math.max(maxExisting + 1, updated ? updated.seq : maxExisting + 1);
+
+  if (updated && updated.seq < nextSeq) {
+    const fixQuery = Counter.findOneAndUpdate(
+      { prefix: 'BILL' },
+      { $set: { seq: nextSeq } }
+    );
+    if (session) fixQuery.session(session);
+    await fixQuery;
   }
 
   const billNo = `BILL-${String(nextSeq).padStart(4, '0')}`;
-
-  try {
-    const highest = Math.max(0, ...existingNums, nextSeq);
-    await Counter.findOneAndUpdate(
-      { prefix: 'BILL' },
-      { $set: { seq: highest } },
-      { upsert: true }
-    );
-  } catch (err) {
-    // Non-fatal
-  }
-
   return billNo;
 }
 
