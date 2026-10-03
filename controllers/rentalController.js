@@ -51,6 +51,7 @@ exports.createRental = async (req, res) => {
       discount: billDiscount = 0, // Bill-level discount
       securityAmount = 0,
       signature = '',
+      billMakingDate,
       pieces = [], // Expect an array of pieces for the bill
     } = req.body;
 
@@ -192,6 +193,7 @@ exports.createRental = async (req, res) => {
         remark,
         status: normalizedStatus,
         total: pieceSubTotal + (Number(penalty) || 0), // Store the piece total (subtotal + penalty). Discount is now separate.
+        billMakingDate: billMakingDate ? new Date(billMakingDate) : new Date(),
         // Default values for other fields
         lostQuantity: 0,
         securityReturned: false,
@@ -277,6 +279,9 @@ exports.updateRental = async (req, res) => {
     }
     if (updates.returnedAt) {
       updates.returnedAt = new Date(updates.returnedAt);
+    }
+    if (updates.billMakingDate) {
+      updates.billMakingDate = new Date(updates.billMakingDate);
     }
 
     console.info('[rentals] update request', {

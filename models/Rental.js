@@ -58,6 +58,7 @@ const rentalSchema = new mongoose.Schema({
   startDate: { type: Date, required: true },
   endDate: { type: Date, required: true },
   total: { type: Number, required: true, min: 0 },
+  billMakingDate: { type: Date, default: Date.now },
   status: { 
     type: String, 
     enum: Object.values(RentalStatus),
