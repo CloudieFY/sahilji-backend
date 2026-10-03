@@ -52,6 +52,9 @@ exports.createRental = async (req, res) => {
       securityAmount = 0,
       signature = '',
       billMakingDate,
+      instaId = '',
+      ownerNumber = '',
+      confirmationChecked = false,
       pieces = [], // Expect an array of pieces for the bill
     } = req.body;
 
@@ -194,6 +197,9 @@ exports.createRental = async (req, res) => {
         status: normalizedStatus,
         total: pieceSubTotal + (Number(penalty) || 0), // Store the piece total (subtotal + penalty). Discount is now separate.
         billMakingDate: billMakingDate ? new Date(billMakingDate) : new Date(),
+        instaId: String(instaId || ''),
+        ownerNumber: String(ownerNumber || ''),
+        confirmationChecked: Boolean(confirmationChecked),
         // Default values for other fields
         lostQuantity: 0,
         securityReturned: false,
